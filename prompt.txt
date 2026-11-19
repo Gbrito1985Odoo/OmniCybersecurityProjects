@@ -1,0 +1,362 @@
+
+Actúa como un arquitecto de software senior y desarrolla una aplicación completa 
+llamada "TraceLens" (paquete Python: tracelens), un analizador inteligente de 
+trazas (logs/traces) con IA local, sistema de etiquetado y chat asistido por IA. 
+La aplicación debe cumplir con TODOS los requisitos siguientes.
+
+=====================================================================
+CONTEXTO Y OBJETIVOS
+=====================================================================
+TraceLens analiza trazas en tiempo real y desde ficheros usando un LLM local 
+(vía Ollama) para detectar errores, patrones anómalos, correlaciones y 
+severidad, enriquece las trazas con etiquetas, permite filtrarlas con listas 
+blancas/negras, genera informes automatizados y ofrece un chat conversacional 
+(RAG) para consultar en lenguaje natural todo lo analizado. Todo el 
+procesamiento es 100% local (sin llamadas a servicios externos).
+
+=====================================================================
+STACK TECNOLÓGICO
+=====================================================================
+- Python 3.11+
+- FastAPI + Uvicorn (API REST + SSE para streaming)
+- asyncio + asyncio.Queue para desacoplar ingesta y análisis
+- Pydantic v2 (esquemas y validación)
+- SQLite (por defecto) con opción a PostgreSQL vía SQLAlchemy 2.x async
+- ChromaDB o FAISS local (vector store para RAG)
+- Ollama como runtime de LLM local (endpoint configurable, por defecto 
+  http://localhost:11434); modelos sugeridos: llama3.2:3b o qwen2.5:7b para 
+  generación, nomic-embed-text para embeddings
+- sentence-transformers como alternativa de embeddings locales
+- APScheduler (informes programados)
+- Jinja2 (plantillas de informes)
+- Typer/Click (CLI)
+- pytest + pytest-asyncio (tests)
+- Dockerfile + docker-compose (incluye servicio Ollama)
+- Frontend ligero con HTMX + Alpine.js o React (chat con streaming SSE)
+
+=====================================================================
+1. ARQUITECTURA GENERAL
+=====================================================================
+Diseña una arquitectura modular por capas:
+- ingestion: captura en tiempo real y lectura de ficheros
+- processing: parsing, normalización, filtrado, etiquetado
+- ai-engine: cliente LLM local, análisis, embeddings, clasificación
+- storage: TraceStore (SQLite/Postgres) y VectorStore (Chroma/FAISS) como 
+  INTERFACES ABSTRACTAS desde la fase 1 (clave para el chat RAG)
+- chat: pipeline RAG y gestión de conversaciones
+- reporting: generación de informes
+- delivery: canales de entrega (email, webhook, Slack, etc.)
+- interface: API REST + UI web + UI de chat
+- config: gestión de configuración y reglas
+
+Estructura de carpetas esperada (ajústala si lo justificas):
+
+tracelens/
+├── pyproject.toml
+├── README.md
+├── docker-compose.yml
+├── Dockerfile
+├── .env.example
+├── config/
+│   ├── config.yaml
+│   ├── rules.yaml
+│   ├── reports.yaml
+│   └── chat.yaml
+├── prompts/
+│   ├── analysis_v1.md
+│   ├── summary_v1.md
+│   ├── report_v1.md
+│   └── chat_rag_v1.md
+├── src/tracelens/
+│   ├── __init__.py
+│   ├── main.py                # entrada FastAPI
+│   ├── cli.py                 # CLI Typer
+│   ├── config.py              # carga de config + Pydantic Settings
+│   ├── ingestion/
+│   │   ├── tail.py
+│   │   ├── file_loader.py
+│   │   ├── network.py         # UDP/TCP/HTTP /ingest
+│   │   └── parsers/           # json, syslog, csv, regex
+│   ├── processing/
+│   │   ├── normalizer.py
+│   │   ├── filters.py         # listas blancas/negras
+│   │   └── labeler.py         # etiquetado (auto/manual/reglas)
+│   ├── ai/
+│   │   ├── llm_client.py      # cliente Ollama
+│   │   ├── analyzer.py        # análisis de trazas
+│   │   ├── embeddings.py
+│   │   └── prompts_loader.py
+│   ├── storage/
+│   │   ├── trace_store.py     # interfaz + impl SQLAlchemy
+│   │   ├── vector_store.py    # interfaz + impl Chroma/FAISS
+│   │   └── models.py          # tablas SQLAlchemy
+│   ├── chat/
+│   │   ├── rag_pipeline.py
+│   │   ├── session.py
+│   │   └── tools.py           # function-calling (consultas estructuradas)
+│   ├── reporting/
+│   │   ├── generator.py
+│   │   ├── scheduler.py       # APScheduler
+│   │   └── templates/
+│   ├── delivery/
+│   │   ├── email.py
+│   │   ├── webhook.py
+│   │   ├── slack.py
+│   │   └── local.py
+│   ├── api/
+│   │   ├── routes_ingest.py
+│   │   ├── routes_traces.py
+│   │   ├── routes_labels.py
+│   │   ├── routes_rules.py
+│   │   ├── routes_chat.py
+│   │   ├── routes_reports.py
+│   │   └── routes_config.py
+│   └── schemas/               # Pydantic: Trace, Label, Rule, ChatMessage...
+├── tests/
+│   ├── test_parsers.py
+│   ├── test_filters.py
+│   ├── test_labeler.py
+│   ├── test_rag.py
+│   └── test_reports.py
+└── web/                       # frontend (chat + dashboard)
+
+=====================================================================
+2. INGESTA DE TRAZAS
+=====================================================================
+a) TIEMPO REAL:
+   - tail -f sobre ficheros (soporta rotación logrotate, múltiples ficheros)
+   - Endpoints: UDP/TCP tipo syslog y HTTP POST /ingest
+   - Buffer configurable y backpressure
+   - Checkpoint de offsets para reanudar tras reinicio
+
+b) FICHEROS:
+   - Lectura de fichero individual o directorio completo
+   - Formatos: JSON lines, texto plano, syslog (RFC5424/3164), CSV, regex 
+     personalizada configurable
+   - Carga paralela con barra de progreso y reanudación por checkpoint
+
+=====================================================================
+3. MOTOR DE ANÁLISIS CON IA LOCAL
+=====================================================================
+Cliente Ollama configurable (endpoint + modelo). El motor debe:
+- Analizar traza individual o ventana temporal y detectar:
+  * errores y excepciones
+  * patrones anómalos (picos, secuencias, repeticiones)
+  * correlaciones entre eventos
+  * indicadores de seguridad (auth failures, inyecciones, scans)
+  * degradación de rendimiento
+- Clasificar severidad: info | warning | error | critical
+- Extraer entidades: IPs, usuarios, endpoints, códigos HTTP, duraciones
+- Generar resumen semántico por bloque de trazas
+- Embeddings locales para agrupar trazas similares y detectar clusters
+- Prompt templates versionados en /prompts
+- Cache de resultados de IA (hash de entrada -> salida) para no reprocesar
+- Reintentos con backoff ante fallos del LLM
+
+=====================================================================
+4. SISTEMA DE ETIQUETADO (LABELS)
+=====================================================================
+Sistema transversal de etiquetas que enriquece las trazas:
+- Etiquetas AUTOMÁTICAS generadas por la IA (ej. error_db, auth_failure, 
+  timeout, pico_trafico)
+- Etiquetas MANUALES creadas por el usuario vía UI/API
+- Etiquetas DERIVADAS de reglas de filtrado
+- Jerarquía categoría > subetiqueta y vocabulario controlado
+- Persistencia en BD con índices para búsqueda rápida
+- API CRUD: crear, listar, renombrar, fusionar, eliminar
+- Filtros por etiqueta combinables con listas blancas/negras
+- Estadísticas por etiqueta: frecuencia, evolución temporal, top N
+- Las etiquetas deben estar disponibles en:
+  * informes generados
+  * consultas del chat
+  * búsquedas y dashboards
+- La IA puede SUGERIR nuevas etiquetas al detectar patrones no catalogados 
+  (con aprobación opcional del usuario)
+
+=====================================================================
+5. CHAT ASISTIDO POR IA (RAG)
+=====================================================================
+Asistente conversacional integrado para consultar las trazas en lenguaje 
+natural.
+
+a) CAPACIDADES:
+   - Preguntas sobre errores concretos
+   - Consultas de agregación ("top 10 IPs con más fallos esta semana")
+   - Explicaciones ("¿por qué se marcó esta traza como crítica?")
+   - Correlaciones ("¿qué ocurrió antes del pico de latencia?")
+   - Comparaciones temporales
+   - Preguntas sobre etiquetas
+   - Generar informes ad-hoc desde el chat
+   - Sugerir reglas de filtrado a partir de la conversación
+
+b) PIPELINE RAG:
+   - Indexación en VectorStore de: trazas normalizadas, resúmenes IA, 
+     etiquetas y metadatos (severidad, timestamps, servicio)
+   - Retrieval top-k por similitud + filtros de metadatos (fecha, servicio, 
+     etiqueta, severidad)
+   - Construcción de contexto acotado (respetar límite del modelo local, 
+     configurable)
+   - Generación con citación de trazas fuente (IDs clicables en la UI)
+   - Function-calling / tool-use: el LLM puede invocar herramientas 
+     estructuradas (query_traces, count_by_label, top_ips, etc.)
+
+c) SESIONES:
+   - Historial por sesión persistido y recuperable
+   - Streaming de respuesta token a token vía SSE
+
+d) UI DE CHAT:
+   - Interfaz web de chat (panel lateral o vista dedicada)
+   - Renderizado markdown, tablas y bloques de código
+   - Enlaces clicables a trazas citadas
+   - Botones rápidos: "generar informe de esto", "crear etiqueta", 
+     "añadir a lista negra"
+   - Selector de contexto previo a preguntar: rango fechas, servicio, 
+     etiqueta, severidad
+
+e) LÍMITES Y SEGURIDAD:
+   - Contexto máximo configurable
+   - Rate limiting y cuotas por sesión
+   - 100% local (sin envío de datos fuera)
+   - Registro de conversaciones para auditoría (configurable)
+
+=====================================================================
+6. FILTRADO: LISTAS BLANCAS Y NEGRAS
+=====================================================================
+Motor de reglas configurable:
+- Reglas por campo: regex, match exacto, contains, comparadores numéricos
+- Combinación lógica AND/OR, prioridades
+- Lista blanca (ignorar coincidencias) y lista negra (forzar análisis/alerta)
+- Reglas por origen: fichero, host, servicio
+- Gestión dinámica vía API y UI (CRUD) con recarga en caliente
+- Persistencia en SQLite o YAML/JSON
+- Modo dry-run contra trazas históricas
+- Métricas por regla: cuántas trazas ha filtrado
+
+=====================================================================
+7. GENERACIÓN AUTOMATIZADA DE INFORMES
+=====================================================================
+- Tipos: resumen periódico (diario/semanal), informe por incidente, 
+  informe bajo demanda por rango de fechas o filtro
+- Contenido: resumen ejecutivo, top errores, anomalías detectadas, 
+  tendencias, distribución de etiquetas, recomendaciones IA
+- Formatos: Markdown, HTML, PDF, JSON
+- Programación con APScheduler o expresión cron configurable
+- Plantillas Jinja2 personalizables
+
+=====================================================================
+8. ENTREGA CONFIGURABLE DE INFORMES
+=====================================================================
+- Canales: Email SMTP, Webhook HTTP, directorio local, S3-compatible, 
+  Slack/Telegram (opcionales)
+- Suscripciones: canal, destinatarios, formato, frecuencia, filtros
+- Registro de envíos y reintentos con backoff
+- API y UI para gestionar suscripciones
+
+=====================================================================
+9. CONFIGURACIÓN Y OPERACIÓN
+=====================================================================
+- config.yaml central + variables de entorno (.env.example)
+- CLI (Typer/Click): iniciar ingesta, lanzar análisis, gestionar reglas y 
+  etiquetas, abrir chat en terminal, generar informe manual, probar reglas 
+  (dry-run)
+- API REST documentada con OpenAPI (/docs)
+- Logs estructurados (structlog o loguru)
+- Healthcheck /health y métricas Prometheus /metrics (opcional)
+- Dockerfile + docker-compose con servicio Ollama incluido
+
+=====================================================================
+10. ENTREGABLES OBLIGATORIOS
+=====================================================================
+1. Estructura de carpetas completa del proyecto
+2. Código funcional de todos los módulos principales (NO pseudocódigo)
+3. Esquemas Pydantic para: Trace, Label, Rule, ChatMessage, ChatSession, 
+   Report, DeliverySubscription, AppConfig
+4. Interfaces abstractas TraceStore y VectorStore con implementaciones
+5. Ficheros de ejemplo: config.yaml, rules.yaml, reports.yaml, chat.yaml
+6. Prompts versionados en /prompts (análisis, resumen, informe, chat RAG)
+7. Tests pytest para: parsers, filtros, etiquetado, pipeline RAG, informes
+8. README completo: instalación, configuración, uso, ejemplo de conversación 
+   con el chat, ejemplos de reglas y de informes
+9. docker-compose.yml funcional (tracelens + ollama + volúmenes)
+10. Frontend mínimo: dashboard de trazas + vista de chat con streaming
+
+=====================================================================
+11. REQUISITOS NO FUNCIONALES
+=====================================================================
+- Procesamiento asíncrono y concurrente
+- Tolerancia a fallos (reintentos, checkpoints)
+- Privacidad total: análisis y chat 100% locales
+- Extensibilidad: plugins para nuevos formatos, canales y herramientas del chat
+- Observabilidad: trazas internas y métricas del propio analizador
+- Código tipado (type hints) y docstrings en módulos públicos
+
+=====================================================================
+12. PLAN DE IMPLEMENTACIÓN POR FASES (OBLIGATORIO)
+=====================================================================
+Antes de escribir código, presenta el plan por fases. Después implementa en 
+este orden, entregando código real en cada fase:
+
+FASE 1 — Núcleo y almacenamiento
+  - Estructura del proyecto, config, modelos Pydantic, TraceStore y 
+    VectorStore (interfaces + implementaciones iniciales)
+
+FASE 2 — Ingesta y parsing
+  - tail, file_loader, parsers (json/syslog/csv/regex), endpoint /ingest
+
+FASE 3 — Filtrado y etiquetado base
+  - Motor de reglas (blancas/negras) con dry-run y métricas
+  - Labeler con etiquetas manuales y por reglas + API CRUD de etiquetas
+
+FASE 4 — Motor IA
+  - Cliente Ollama, analyzer, embeddings, etiquetado automático, cache, 
+    prompts versionados
+
+FASE 5 — Informes y entrega
+  - Generador de informes, plantillas Jinja2, scheduler APScheduler, 
+    canales de entrega y suscripciones
+
+FASE 6 — Chat RAG
+  - Indexación en VectorStore, pipeline RAG, tool-use, sesiones, SSE, 
+    UI de chat
+
+FASE 7 — Frontend, Docker y documentación
+  - Dashboard, docker-compose completo, README final, ejemplos
+
+Empieza ya con el plan y la FASE 1. En cada fase, muestra el árbol de 
+ficheros afectados, el código completo de cada uno y cómo probarlo.
+Cómo usarlo con OpenCode
+Pégalo tal cual en la primera sesión. OpenCode empezará proponiendo el plan y la Fase 1.
+
+Pídele que confirme el plan antes de codificar con algo como: "Muéstrame el plan y espera mi OK antes de escribir código".
+
+Al terminar cada fase, abre una nueva sesión corta con: "Continúa con la Fase N del proyecto TraceLens adjunto" y adjunta los ficheros generados. Así evitas saturar el contexto.
+
+Si tu hardware es limitado, añade al final: "Mi equipo tiene X GB de RAM y GPU con Y GB de VRAM; elige modelos y tamaños de embeddings acordes (ej. llama3.2:3b + nomic-embed-text)".
+
+Para el chat (Fase 6), si el contexto se queda corto, usa el prompt reducido que te dejo abajo en una sesión aparte.
+
+Prompt reducido para la Fase 6 (chat RAG), por si lo necesitas aislado
+text
+Sobre el proyecto TraceLens ya implementado (ingesta, IA, etiquetas, filtrado, 
+informes), implementa la FASE 6: CHAT ASISTIDO POR IA con pipeline RAG.
+
+Requisitos:
+- Indexación en ChromaDB (o FAISS) local de trazas normalizadas, resúmenes IA, 
+  etiquetas y metadatos (timestamp, servicio, severidad)
+- Embeddings con Ollama (nomic-embed-text) o sentence-transformers
+- Retrieval top-k con filtros de metadatos combinables
+- Construcción de contexto acotado configurable + generación con el LLM local
+- Function-calling: herramientas query_traces, count_by_label, top_ips, 
+  time_range_summary
+- Respuestas con citación de trazas fuente (IDs clicables)
+- Sesiones con historial persistido en BD
+- Streaming token a token vía SSE en /api/chat/stream
+- UI de chat (HTMX o React) con markdown, tablas, enlaces a trazas y botones 
+  rápidos ("generar informe", "crear etiqueta", "añadir a lista negra")
+- Rate limiting y cuota por sesión
+- Tests pytest del pipeline RAG con casos de ejemplo
+- Actualizar README con ejemplo de conversación
+
+Entrega código funcional, esquemas Pydantic del chat y del historial, 
+prompts en /prompts/chat_rag_v1.md y actualización de docker-compose si hace 
+falta el vector store.

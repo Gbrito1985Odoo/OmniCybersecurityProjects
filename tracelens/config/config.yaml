@@ -1,0 +1,16 @@
+# Configuración central de TraceLens (Fase 1)
+# Variables de entorno: TRACELENS_* (ver .env.example)
+
+log_level: INFO
+
+db_url: sqlite+aiosqlite:///./data/tracelens.db
+
+vector_store_type: chroma
+chroma_persist_dir: ./data/chroma
+
+ollama_host: http://localhost:11434
+analysis_model: llama3.2:3b
+embed_model: nomic-embed-text
+
+ingestion_buffer_size: 1000
+ingestion_checkpoint_interval: 100
